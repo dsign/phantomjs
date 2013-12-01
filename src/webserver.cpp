@@ -114,6 +114,9 @@ bool WebServer::listenOnPort(const QString& port, const QVariantMap& opts)
     QVector<const char*> options;
     options <<  "listening_ports" << qstrdup(qPrintable(port));
     options << "enable_directory_listing" << "no";
+    //
+    options << "error_log_file" << "these_errors.err" ;
+    //
     if (opts.value("keepAlive", false).toBool()) {
         options << "enable_keep_alive" << "yes";
     }
@@ -128,7 +131,7 @@ bool WebServer::listenOnPort(const QString& port, const QVariantMap& opts)
     m_port = port;
     return true;
 }
-
+    
 QString WebServer::port() const
 {
     return m_port;

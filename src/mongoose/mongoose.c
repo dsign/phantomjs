@@ -174,6 +174,7 @@ typedef struct DIR {
 #else    // UNIX  specific
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -226,6 +227,7 @@ typedef int SOCKET;
 #define MAX_CGI_ENVIR_VARS 64
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof(array[0]))
 
+// #define DEBUG 1
 #if defined(DEBUG)
 #define DEBUG_TRACE(x) do { \
   flockfile(stdout); \
@@ -245,6 +247,8 @@ typedef int SOCKET;
 #ifdef NO_SOCKLEN_T
 typedef int socklen_t;
 #endif // NO_SOCKLEN_T
+
+#define UNIX_PATH_MAX 108
 
 typedef void * (*mg_thread_func_t)(void *);
 
@@ -367,9 +371,11 @@ static const char *month_names[] = {
 // in the union u.
 struct usa {
   socklen_t len;
+  int domain;
   union {
     struct sockaddr sa;
     struct sockaddr_in sin;
+    struct sockaddr_un sun;
   } u;
 };
 
@@ -431,6 +437,7 @@ static const char *config_options[] = {
   "s", "ssl_certificate", NULL,
   "t", "num_threads", "10",
   "u", "run_as_user", NULL,
+  //"x", "unix_socket_path",NULL,
   NULL
 };
 #define ENTRIES_PER_CONFIG_OPTION 3
@@ -527,10 +534,10 @@ static void cry(struct mg_connection *conn, const char *fmt, ...) {
       flockfile(fp);
       timestamp = time(NULL);
 
-      (void) fprintf(fp,
+      /*(void) fprintf(fp,
           "[%010lu] [error] [client %s] ",
           (unsigned long) timestamp,
-          inet_ntoa(conn->client.rsa.u.sin.sin_addr));
+          inet_ntoa(conn->client.rsa.u.sin.sin_addr)); */
 
       if (conn->request_info.request_method != NULL) {
         (void) fprintf(fp, "%s %s: ",
@@ -3308,30 +3315,49 @@ static void close_all_listening_sockets(struct mg_context *ctx) {
 static int parse_port_string(const struct vec *vec, struct socket *so) {
   struct usa *usa = &so->lsa;
   int a, b, c, d, port, len;
+  char* unix_path;
 
   // MacOS needs that. If we do not zero it, subsequent bind() will fail.
   memset(so, 0, sizeof(*so));
 
+  unix_path = (char*) malloc( UNIX_PATH_MAX );
+  unix_path[0] = 0;
+
   if (sscanf(vec->ptr, "%d.%d.%d.%d:%d%n", &a, &b, &c, &d, &port, &len) == 5) {
     // IP address to bind to is specified
     usa->u.sin.sin_addr.s_addr = htonl((a << 24) | (b << 16) | (c << 8) | d);
-  } else if (sscanf(vec->ptr, "%d%n", &port, &len) == 1) {
+    usa->u.sin.sin_family = AF_INET;
+    usa->u.sin.sin_port = htons((uint16_t) port);
+    usa->domain = AF_INET;
+    so->is_ssl = vec->ptr[len] == 's';
+    so->is_proxy = vec->ptr[len] == 'p';
+    usa->len = sizeof(usa->u.sin);
+  } else if(sscanf(vec->ptr, "unix:%s%n", unix_path, &len) == 1 ) {
+    // Unix domain socket
+    strcpy( usa->u.sun.sun_path, unix_path);
+    usa->u.sun.sun_family = AF_UNIX;
+    usa->len = sizeof(usa->u.sun);
+    usa->domain = AF_UNIX;
+    so->is_ssl = 0;
+    so->is_proxy = 0; // <-- !!
+  }else if (sscanf(vec->ptr, "%d%n", &port, &len) == 1) {
     // Only port number is specified. Bind to all addresses
     usa->u.sin.sin_addr.s_addr = htonl(INADDR_ANY);
+    usa->u.sin.sin_family = AF_INET;
+    usa->u.sin.sin_port = htons((uint16_t) port);
+    usa->domain = AF_INET;
+    so->is_ssl = vec->ptr[len] == 's';
+    so->is_proxy = vec->ptr[len] == 'p';
+    usa->len = sizeof(usa->u.sin);
   } else {
     return 0;
   }
   assert(len > 0 && len <= (int) vec->len);
 
+  free( unix_path );
   if (strchr("sp,", vec->ptr[len]) == NULL) {
     return 0;
   }
-
-  so->is_ssl = vec->ptr[len] == 's';
-  so->is_proxy = vec->ptr[len] == 'p';
-  usa->len = sizeof(usa->u.sin);
-  usa->u.sin.sin_family = AF_INET;
-  usa->u.sin.sin_port = htons((uint16_t) port);
 
   return 1;
 }
@@ -3346,35 +3372,45 @@ static int set_ports_option(struct mg_context *ctx) {
   while (success && (list = next_option(list, &vec, NULL)) != NULL) {
     if (!parse_port_string(&vec, &so)) {
       cry(fc(ctx), "%s: %.*s: invalid port spec. Expecting list of: %s",
-          __func__, vec.len, vec.ptr, "[IP_ADDRESS:]PORT[s|p]");
+          __func__, vec.len, vec.ptr, "[IP_ADDRESS:]PORT[s|p]|unix:PATH");
       success = 0;
-    } else if (so.is_ssl && ctx->ssl_ctx == NULL) {
-      cry(fc(ctx), "Cannot add SSL socket, is -ssl_cert option set?");
-      success = 0;
-    } else if ((sock = socket(PF_INET, SOCK_STREAM, 6)) == INVALID_SOCKET ||
-#if !defined(_WIN32)
-               // On Windows, SO_REUSEADDR is recommended only for
-               // broadcast UDP sockets
-               setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
-                          sizeof(reuseaddr)) != 0 ||
-#endif // !_WIN32
-               bind(sock, &so.lsa.u.sa, so.lsa.len) != 0 ||
-               listen(sock, 20) != 0) {
-      closesocket(sock);
-      cry(fc(ctx), "%s: cannot bind to %.*s: %s", __func__,
-          vec.len, vec.ptr, strerror(ERRNO));
-      success = 0;
-    } else if ((listener = (struct socket *)
-                calloc(1, sizeof(*listener))) == NULL) {
-      closesocket(sock);
-      cry(fc(ctx), "%s: %s", __func__, strerror(ERRNO));
-      success = 0;
-    } else {
-      *listener = so;
-      listener->sock = sock;
-      set_close_on_exec(listener->sock);
-      listener->next = ctx->listening_sockets;
-      ctx->listening_sockets = listener;
+    } else 
+    {
+        if ( so.lsa.domain == AF_UNIX )
+        {
+            // Be sure to remove unix-domain sockets on existence
+            unlink(so.lsa.u.sun.sun_path );
+        }
+
+        if (so.is_ssl && ctx->ssl_ctx == NULL) {
+          cry(fc(ctx), "Cannot add SSL socket, is -ssl_cert option set?");
+          success = 0;
+        } else if ((sock = socket(so.lsa.domain, SOCK_STREAM, 0)) == INVALID_SOCKET ||
+    #if !defined(_WIN32)
+                   // On Windows, SO_REUSEADDR is recommended only for
+                   // broadcast UDP sockets
+                   setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
+                              sizeof(reuseaddr)) != 0 ||
+    #endif // !_WIN32
+                   bind(sock, &so.lsa.u.sa, so.lsa.len) != 0 ||
+                   listen(sock, 20) != 0) {
+          cry(fc(ctx), "invalid socket: %d, family was AF_UNIX: %d", sock == INVALID_SOCKET, so.lsa.domain == AF_UNIX );
+          closesocket(sock);
+          cry(fc(ctx), "%s: cannot bind to %.*s: %s", __func__,
+              vec.len, vec.ptr, strerror(ERRNO));
+          success = 0;
+        } else if ((listener = (struct socket *)
+                    calloc(1, sizeof(*listener))) == NULL) {
+          closesocket(sock);
+          cry(fc(ctx), "%s: %s", __func__, strerror(ERRNO));
+          success = 0;
+        } else {
+          *listener = so;
+          listener->sock = sock;
+          set_close_on_exec(listener->sock);
+          listener->next = ctx->listening_sockets;
+          ctx->listening_sockets = listener;
+        }
     }
   }
 
